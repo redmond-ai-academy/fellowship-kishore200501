@@ -13,7 +13,7 @@ import pytest
 # The code lives one folder up. This line lets `pytest` find it from anywhere.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from llm import FakeClient  # noqa: E402
+from llm import FakeClient, ModelCallError  # noqa: E402
 from models import Category, Priority, Triage, TriageError  # noqa: E402
 from triage import triage  # noqa: E402
 
@@ -94,3 +94,23 @@ def test_every_attempt_writes_a_trace_line(tmp_path):
     assert second["error"] is None
     assert second["model"] == "fake-model"
     assert second["input_chars"] == len(TICKET)
+
+
+def test_model_call_error_writes_trace_and_raises(tmp_path):
+    class FailingClient:
+        model_name = "failing-model"
+
+        def generate_json(self, *args, **kwargs):
+            raise ModelCallError("Network connection reset")
+
+    with pytest.raises(ModelCallError, match="Network connection reset"):
+        triage(TICKET, FailingClient(), trace_dir=tmp_path)
+
+    traces = read_trace_lines(tmp_path)
+    assert len(traces) == 1
+    assert traces[0]["attempt"] == 1
+    assert traces[0]["ok"] is False
+    assert "Network connection reset" in traces[0]["error"]
+    assert traces[0]["model"] == "failing-model"
+    assert traces[0]["input_chars"] == len(TICKET)
+    assert traces[0]["latency_ms"] >= 0

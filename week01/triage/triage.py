@@ -8,7 +8,12 @@ The part you build is `triage()`: call the model, validate what comes back,
 retry once if it was wrong, and leave a trace of every attempt.
 """
 
+from datetime import date, datetime, timezone
+import json
 from pathlib import Path
+import time
+
+from pydantic import ValidationError
 
 from llm import ModelClient
 from models import Triage, TriageError
@@ -86,16 +91,62 @@ def triage(
     """
     user_message = build_user_message(ticket_text)
 
-    # TODO 1: Ask the model. Call client.generate_json with SYSTEM_INSTRUCTION, the user message,
-    #         the Triage schema and the temperature. Time the call.
-    # TODO 2: Validate the raw text with Pydantic. Decide which exception(s) mean "the model's
-    #         reply was bad", and which mean "something else is wrong" and should not be hidden.
-    # TODO 3: If validation failed and this was the first attempt, try again once. This time,
-    #         tell the model what went wrong, using what you know about the previous reply.
-    # TODO 4: If the second attempt also fails, raise TriageError with a message a support
-    #         engineer could act on.
-    # TODO 5: For every attempt, write one trace line (see the docstring). Create the folder
-    #         if it does not exist. Think about what should be in `error` when ok is True.
-    # TODO 6: Run `python -m pytest week01/triage/tests` from the repo root until all four pass.
-    #         Then delete this raise.
-    raise NotImplementedError("Week 1: finish triage() by working through the TODOs above.")
+    current_message = user_message
+    last_error: Exception | None = None
+
+    def write_trace(attempt: int, latency_ms: int, ok: bool, error: str | None) -> None:
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        trace_file = trace_dir / f"{date.today().isoformat()}.jsonl"
+        trace_record = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "model": client.model_name,
+            "attempt": attempt,
+            "latency_ms": latency_ms,
+            "ok": ok,
+            "error": error,
+            "input_chars": len(ticket_text),
+        }
+        with trace_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(trace_record) + "\n")
+
+    for attempt in (1, 2):
+        start_time = time.perf_counter()
+        try:
+            raw_text = client.generate_json(
+                SYSTEM_INSTRUCTION,
+                current_message,
+                Triage,
+                temperature,
+            )
+        except Exception as exc:
+            latency_ms = round((time.perf_counter() - start_time) * 1000)
+            write_trace(attempt, latency_ms, ok=False, error=str(exc))
+            raise
+
+        latency_ms = round((time.perf_counter() - start_time) * 1000)
+
+        result: Triage | None = None
+        error_details: str | None = None
+
+        try:
+            result = Triage.model_validate_json(raw_text)
+        except ValidationError as exc:
+            error_details = str(exc)
+            last_error = exc
+
+        write_trace(attempt, latency_ms, ok=result is not None, error=error_details)
+
+        if result is not None:
+            return result
+
+        if attempt == 1:
+            current_message = (
+                f"{user_message}\n\n"
+                f"Your previous response was:\n{raw_text}\n\n"
+                f"It failed validation with the following error:\n{error_details}\n\n"
+                f"Please fix the error and reply with valid JSON matching the schema."
+            )
+
+    raise TriageError(
+        f"Model failed to produce valid triage output after 2 attempts. Last error: {last_error}"
+    )
